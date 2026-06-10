@@ -243,6 +243,7 @@ interface TradeBarrier {
 interface CyberThreat {
   country?: string;
   severity?: string;
+  firstSeenAt?: number | string;
 }
 
 interface InternetOutage {
@@ -311,15 +312,13 @@ const RESILIENCE_FATF_LISTING_KEY = 'economic:fatf-listing:v1';
 const RESILIENCE_CYBER_KEY = 'cyber:threats:v2';
 const RESILIENCE_OUTAGES_KEY = 'infra:outages:v1';
 const RESILIENCE_GPS_KEY = 'intelligence:gpsjam:v2';
-// Issue #3971: bound the severity weight a single `cyber:threats:v2`
-// snapshot can contribute before `normalizeLowerBetter(weightedCount, 0, 25)`.
-// This is a PER-SNAPSHOT cap, not multi-day smoothing: the feed stamps
-// `lastSeenAt` at ~fetch time and never populates `firstSeenAt`, so every
-// refresh is effectively a single observation day with no cross-day spread
-// to average over. Capping the total prevents a same-day burst from
-// saturating the cyber sub-component to 0 and swinging a country 5+ ranks.
-// Exported so tests pin behaviour to the constant, not a literal.
+// Issue #3971: bound the severity weight any one cyber discovery day can
+// contribute before `normalizeLowerBetter(weightedCount, 0, 25)`. Issue #4008
+// later made firstSeenAt stable enough for #4009's discovery-day smoothing: a
+// one-day burst now decays by age, while sustained multi-day pressure can still
+// reach the cap. Exported so tests pin behaviour to constants, not literals.
 export const CYBER_SNAPSHOT_WEIGHT_CAP = 8;
+export const CYBER_DISCOVERY_HALF_LIFE_DAYS = 1;
 const RESILIENCE_UNREST_KEY = 'unrest:events:v1';
 const RESILIENCE_UCDP_KEY = 'conflict:ucdp-events:v1';
 const RESILIENCE_DISPLACEMENT_PREFIX = 'displacement:summary:v1';
@@ -1105,7 +1104,42 @@ export function summarizeGps(raw: unknown, countryCode: string): { high: number;
   }, { high: 0, medium: 0 });
 }
 
-export function summarizeCyber(raw: unknown, countryCode: string): { weightedCount: number } {
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Lower than any WorldMonitor-sourced firstSeenAt; smaller numbers are usually
+// Unix seconds and should fall back to the current bucket.
+const MIN_FIRST_SEEN_EPOCH_MS = 1e11;
+
+interface CyberDiscoveryOptions {
+  nowMs?: number;
+}
+
+function readEpochMs(value: unknown): number | null {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  const numeric = typeof value === 'number' ? value : trimmed.length > 0 ? Number(trimmed) : NaN;
+  if (Number.isFinite(numeric)) {
+    return numeric >= MIN_FIRST_SEEN_EPOCH_MS ? numeric : null;
+  }
+  if (trimmed.length === 0) return null;
+  const parsed = Date.parse(trimmed);
+  return Number.isFinite(parsed) && parsed >= MIN_FIRST_SEEN_EPOCH_MS ? parsed : null;
+}
+
+function cyberDiscoveryAgeDays(firstSeenAt: unknown, nowMs: number): number {
+  const firstSeenMs = readEpochMs(firstSeenAt);
+  if (firstSeenMs == null || !Number.isFinite(nowMs) || nowMs <= 0) return 0;
+  return Math.max(0, Math.floor((nowMs - firstSeenMs) / DAY_MS));
+}
+
+function cyberDiscoveryDecay(ageDays: number): number {
+  if (!Number.isFinite(ageDays) || ageDays <= 0) return 1;
+  return 2 ** (-ageDays / CYBER_DISCOVERY_HALF_LIFE_DAYS);
+}
+
+export function summarizeCyber(
+  raw: unknown,
+  countryCode: string,
+  options: CyberDiscoveryOptions = {},
+): { weightedCount: number } {
   const threats: CyberThreat[] = Array.isArray((raw as { threats?: unknown[] } | null)?.threats)
     ? ((raw as { threats?: CyberThreat[] }).threats ?? [])
     : [];
@@ -1116,12 +1150,21 @@ export function summarizeCyber(raw: unknown, countryCode: string): { weightedCou
     CRITICALITY_LEVEL_LOW: 0.5,
   };
 
-  const totalWeight = threats.reduce((sum, threat) => {
-    if (!matchesCountryIdentifier(threat.country, countryCode)) return sum;
-    return sum + (SEVERITY_WEIGHT[String(threat.severity || '')] ?? 1);
-  }, 0);
+  const nowMs = Number.isFinite(options.nowMs) ? Number(options.nowMs) : Date.now();
+  const weightsByAgeDay = new Map<number, number>();
+  for (const threat of threats) {
+    if (!matchesCountryIdentifier(threat.country, countryCode)) continue;
+    const ageDays = cyberDiscoveryAgeDays(threat.firstSeenAt, nowMs);
+    const severityWeight = SEVERITY_WEIGHT[String(threat.severity || '')] ?? 1;
+    weightsByAgeDay.set(ageDays, (weightsByAgeDay.get(ageDays) ?? 0) + severityWeight);
+  }
 
-  return { weightedCount: Math.min(totalWeight, CYBER_SNAPSHOT_WEIGHT_CAP) };
+  let decayedWeight = 0;
+  for (const [ageDays, weight] of weightsByAgeDay) {
+    decayedWeight += Math.min(weight, CYBER_SNAPSHOT_WEIGHT_CAP) * cyberDiscoveryDecay(ageDays);
+  }
+
+  return { weightedCount: Math.min(decayedWeight, CYBER_SNAPSHOT_WEIGHT_CAP) };
 }
 
 export function summarizeUnrest(raw: unknown, countryCode: string): { unrestCount: number; fatalities: number } {
@@ -1626,13 +1669,14 @@ function fatfStatusToScore(status: FatfStatus): number {
 export async function scoreCyberDigital(
   countryCode: string,
   reader: ResilienceSeedReader = defaultSeedReader,
+  options?: CyberDiscoveryOptions,
 ): Promise<ResilienceDimensionScore> {
   const [cyberRaw, outagesRaw, gpsRaw] = await Promise.all([
     reader(RESILIENCE_CYBER_KEY),
     reader(RESILIENCE_OUTAGES_KEY),
     reader(RESILIENCE_GPS_KEY),
   ]);
-  const cyber = summarizeCyber(cyberRaw, countryCode);
+  const cyber = summarizeCyber(cyberRaw, countryCode, options);
   const outages = summarizeOutages(outagesRaw, countryCode);
   const gps = summarizeGps(gpsRaw, countryCode);
   const outagePenalty = outages.total * 4 + outages.major * 2 + outages.partial;

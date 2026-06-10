@@ -17,6 +17,7 @@ import {
   runWorker,
   validate,
 } from '../scripts/seed-recovery-import-hhi.mjs';
+import { ISO2_TO_COMTRADE } from '../server/worldmonitor/intelligence/v1/_comtrade-reporters.js';
 
 const seedSrc = readFileSync(new URL('../scripts/seed-recovery-import-hhi.mjs', import.meta.url), 'utf8');
 const reporterOverrides = JSON.parse(
@@ -41,16 +42,8 @@ describe('seed-recovery-import-hhi', () => {
       readFileSync(new URL('../scripts/shared/un-to-iso2.json', import.meta.url), 'utf8'),
     );
     const iso2ToUn = Object.fromEntries(Object.entries(unToIso2).map(([un, iso2]) => [iso2, un]));
-    const canonicalSrc = readFileSync(
-      new URL('../server/worldmonitor/intelligence/v1/_comtrade-reporters.ts', import.meta.url),
-      'utf8',
-    );
-    const canonical = {};
-    for (const match of canonicalSrc.matchAll(/\b([A-Z]{2}): '([0-9]{3})'/g)) {
-      canonical[match[1]] = match[2];
-    }
     const expectedOverrides = {};
-    for (const [iso2, code] of Object.entries(canonical)) {
+    for (const [iso2, code] of Object.entries(ISO2_TO_COMTRADE)) {
       if (iso2ToUn[iso2] && iso2ToUn[iso2] !== code) expectedOverrides[iso2] = code;
     }
     assert.deepEqual(reporterOverrides, expectedOverrides);
@@ -70,13 +63,30 @@ describe('seed-recovery-import-hhi', () => {
 
   it('validate rejects catastrophic partial import-HHI snapshots below the publish floor', () => {
     const partial = Object.fromEntries(
-      Array.from({ length: 134 }, (_, i) => [`T${i}`, { hhi: 0.1 }]),
+      Array.from({ length: 130 }, (_, i) => [`T${i}`, { hhi: 0.1 }]),
     );
     const sufficient = Object.fromEntries(
-      Array.from({ length: 135 }, (_, i) => [`T${i}`, { hhi: 0.1 }]),
+      Array.from({ length: 131 }, (_, i) => [`T${i}`, { hhi: 0.1 }]),
     );
+    for (const iso2 of ['AE', 'RU', 'NO', 'CH']) {
+      partial[iso2] = { hhi: 0.1 };
+      sufficient[iso2] = { hhi: 0.1 };
+    }
     assert.equal(validate({ countries: partial }), false);
     assert.equal(validate({ countries: sufficient }), true);
+  });
+
+  it('validate rejects otherwise sufficient snapshots that still strand watched reporters', () => {
+    const countries = Object.fromEntries(
+      Array.from({ length: 170 }, (_, i) => [`T${i}`, { hhi: 0.1 }]),
+    );
+    countries.AE = { hhi: 0.1 };
+    countries.RU = { hhi: 0.1 };
+    countries.NO = { hhi: 0.1 };
+
+    assert.equal(validate({ countries }), false);
+    countries.CH = { hhi: 0.1 };
+    assert.equal(validate({ countries }), true);
   });
 
   it('treats validation rejects as seed failures so partial runs do not refresh seed-meta', () => {
